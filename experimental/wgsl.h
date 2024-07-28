@@ -79,6 +79,46 @@ std::string loopUnrolling(const std::string& code, int threshold = 32) {
   return unrolledCode;
 }
 
+
+std::string removeUnnecessaryIfStatements(const std::string& code) {
+  // Pattern to match if(true) {...} else {...}
+  std::regex ifTrueElsePattern(R"(if\s*\(\s*true\s*\)\s*\{([^{}]*)\}\s*else\s*\{([^{}]*)\})");
+  // Pattern to match if(false) {...} else {...}
+  std::regex ifFalseElsePattern(R"(if\s*\(\s*false\s*\)\s*\{([^{}]*)\}\s*else\s*\{([^{}]*)\})");
+  // Pattern to match if(true) {...}
+  std::regex ifTruePattern(R"(if\s*\(\s*true\s*\)\s*\{([^{}]*)\})");
+  // Pattern to match if(false) {...}
+  std::regex ifFalsePattern(R"(if\s*\(\s*false\s*\)\s*\{([^{}]*)\})");
+
+  std::string optimizedCode = code;
+  std::smatch match;
+
+  // Handle if(true) {...} else {...}
+  while (std::regex_search(optimizedCode, match, ifTrueElsePattern)) {
+    std::string trueBlock = match[1].str();
+    optimizedCode = optimizedCode.substr(0, match.position()) + trueBlock + optimizedCode.substr(match.position() + match.length());
+  }
+
+  // Handle if(false) {...} else {...}
+  while (std::regex_search(optimizedCode, match, ifFalseElsePattern)) {
+    std::string elseBlock = match[2].str();
+    optimizedCode = optimizedCode.substr(0, match.position()) + elseBlock + optimizedCode.substr(match.position() + match.length());
+  }
+
+  // Handle if(true) {...}
+  while (std::regex_search(optimizedCode, match, ifTruePattern)) {
+    std::string trueBlock = match[1].str();
+    optimizedCode = optimizedCode.substr(0, match.position()) + trueBlock + optimizedCode.substr(match.position() + match.length());
+  }
+
+  // Handle if(false) {...}
+  while (std::regex_search(optimizedCode, match, ifFalsePattern)) {
+    optimizedCode = optimizedCode.substr(0, match.position()) + optimizedCode.substr(match.position() + match.length());
+  }
+
+  return optimizedCode;
+}
+
 } // namespace gpu
 
 #endif
