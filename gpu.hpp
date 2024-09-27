@@ -1442,30 +1442,21 @@ inline void dispatchKernel(Context &ctx, Kernel &kernel,
 }
 
 #ifdef __APPLE__
-#include <Metal/Metal.h>
-#include <QuartzCore/CAMetalLayer.h>
 
-class MetalShaderProfiler {
-public:
-  MetalShaderProfiler() : device(nil), captureManager(nil), captureScope(nil) {
-    device = MTLCreateSystemDefaultDevice();
-    captureManager = MTLCaptureManager::sharedCaptureManager();
-    captureScope = [captureManager newCaptureScopeWithDevice:device];
-  }
+extern "C" {
+  void startCapture();
+  void stopCapture();
+  void profileKernel(void (*kernelFunc)());
+}
 
-  void startCapture() {
-    [captureScope beginScope];
-  }
+inline void startProfiling() {
+  startCapture();
+}
 
-  void stopCapture() {
-    [captureScope endScope];
-  }
+inline void stopProfiling() {
+  stopCapture();
+}
 
-private:
-  id<MTLDevice> device;
-  MTLCaptureManager *captureManager;
-  id<MTLCaptureScope> captureScope;
-};
 #endif
 
 } // namespace gpu
