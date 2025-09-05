@@ -613,6 +613,66 @@ inline KernelCode createMatmulWithTranspose(const char *shaderTemplate, const si
   return {unrolledCode, workgroupSize, precision};
 }
 
+inline KernelCode createMatmul12(const char *shaderTemplate, const size_t M,
+                                 const size_t K, const size_t N,
+                                 NumType precision = kf32) {
+  std::string codeString(shaderTemplate);
+  replaceAll(codeString, {{"{{precision}}", toString(precision)},
+                          {"{{M}}", toString(M)},
+                          {"{{K}}", toString(K)},
+                          {"{{N}}", toString(N)}});
+  return {codeString, {256, 1, 1}, precision};
+}
+
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Optimised WGSL matrix‑multiply kernel using subgroupMatrixLoad/Store
+//  and subgroupMatrixMultiplyAccumulate
+// ─────────────────────────────────────────────────────────────────────────────
+const char* kShaderSubgroupMatrixMultiply = R"(
+enable chromium_experimental_subgroup_matrix;
+
+@group(0) @binding(0) var<storage, read> A: array<{{precision}}>;
+@group(0) @binding(1) var<storage, read> B: array<{{precision}}>;
+@group(0) @binding(2) var<storage, read_write> C: array<{{precision}}>;
+
+// Each workgroup computes one 16x16 tile of C.
+@compute @workgroup_size(256, 1, 1)
+fn main(@builtin(workgroup_id) groupID: vec3<u32>) {
+
+    let tileRow = groupID.y;
+    let tileCol = groupID.x;
+
+    let outRowStart = tileRow * 16u;
+    let outColStart = tileCol * 16u;
+
+    if (outRowStart >= {{M}} || outColStart >= {{N}}) {
+        return;
+    }
+
+    var acc: subgroup_matrix_result<{{precision}}, 16, 16>;
+
+    let kTiles = ({{K}} + 15u) / 16u;
+
+    // Load the first tile and multiply to initialize accumulator
+    let a_tile_0 = subgroupMatrixLoad<subgroup_matrix_left<{{precision}}, 16, 16>>(A, outRowStart * {{K}}, true, {{K}});
+    let b_tile_0 = subgroupMatrixLoad<subgroup_matrix_right<{{precision}}, 16, 16>>(B, outColStart, true, {{N}});
+    acc = subgroupMatrixMultiply<{{precision}}>(a_tile_0, b_tile_0);
+
+    // Loop over the rest of the K-dimension
+    for (var kTile: u32 = 1u; kTile < kTiles; kTile = kTile + 1u) {
+        let k = kTile * 16u;
+        let a_tile = subgroupMatrixLoad<subgroup_matrix_left<{{precision}}, 16, 16>>(A, outRowStart * {{K}} + k, true, {{K}});
+        let b_tile = subgroupMatrixLoad<subgroup_matrix_right<{{precision}}, 16, 16>>(B, k * {{N}} + outColStart, true, {{N}});
+        acc = subgroupMatrixMultiplyAccumulate(a_tile, b_tile, acc);
+    }
+
+    subgroupMatrixStore(C, outRowStart * {{N}} + outColStart, acc, true, {{N}});
+}
+)";
+
+
 /**
  * @brief No-Op shader with matmul bindings for performance testing
  */
@@ -775,6 +835,16 @@ Kernel selectMatmul(Context &ctx, int version,
 						  numtype);
     kernel = createKernel(ctx, matmul, bindings,
                           /*nWorkgroups*/ nWorkgroups);
+  } else if (version == 12) {
+    // f32: Subgroup matrix multiply
+    Shape wgSize = {256, 1, 1}; // One subgroup per workgroup
+    Shape nWorkgroups = {cdiv(N, 16), cdiv(M, 16), 1};
+    LOG(kDefLog, kInfo, "M: %zu, K: %zu, N: %zu", M, K, N);
+    LOG(kDefLog, kInfo, "wgSize: ( %s )", toString(wgSize).c_str());
+    LOG(kDefLog, kInfo, "nWorkgroups: ( %s )", toString(nWorkgroups).c_str());
+    KernelCode matmul =
+        createMatmul12(kShaderSubgroupMatrixMultiply, M, K, N, numtype);
+    kernel = createKernel(ctx, matmul, bindings, nWorkgroups);
   }
   return kernel;
 }
@@ -859,7 +929,7 @@ void runTest(int version, size_t M, size_t K, size_t N,
   // Use microsecond for more accurate time measurement
   auto duration =
       std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-  float gflops = 2 * M * N *
+  float gflops = 2.0f * M * N *
                  K / // factor of 2 for multiplication & accumulation
                  (static_cast<double>(duration.count()) / 1000000.0) /
                  1000000000.0 * static_cast<float>(nIter);
@@ -870,7 +940,7 @@ void runTest(int version, size_t M, size_t K, size_t N,
       show<precision>(outputPtr.get(), M, N, "Output[0]").c_str());
 
   LOG(kDefLog, kInfo, "\n\n===================================================================="
-      "============\nExecution Time: (M = %d, K = %d, N = %d) x %d iterations "
+      "============\nExecution Time: (M = %zu, K = %zu, N = %zu) x %zu iterations "
       ":\n%.1f "
       "milliseconds / dispatch ~ %.2f "
       "GFLOPS\n================================================================"
@@ -911,15 +981,16 @@ const std::string versionToStr(int version){
   case 7: return  "f32: 2D blocktiling with loop unrolling";
   case 8: return  "f32: 2D blocktiling with loop unrolling and vectorization";
   case 9: return  "f32: 2D blocktiling with loop unrolling, vectorization and transpose";
-  case 10: return "f16: 2D blocktiling with loop unrolling and vectorization";
+  case 10: return "f16: 2D blocktiling with loop unrolling and vectorization (default)";
   case 11: return "f16: 2D blocktiling with loop unrolling, vectorization and transpose";
+  case 12: return "f32: Subgroup matrix multiply";
   default: return "Not specified";
   }
 }
 
 int main() {
   char* version_str = getenv("MATMUL_VERSION");
-  int version = version_str == NULL ? 10 : atoi(version_str);
+  int version = version_str == NULL ? 12 : atoi(version_str);
     // 1 == f32: No-Op
     // 2 == f32: naive matmul
     // 3 == f32: tiling
@@ -931,8 +1002,9 @@ int main() {
     // 9 == f32: 2D blocktiling with loop unrolling, vectorization and transpose
     // 10 == f16: 2D blocktiling with loop unrolling and vectorization (default)
     // 11 == f16: 2D blocktiling with loop unrolling, vectorization and transpose
+    // 12 == f32: Subgroup matrix multiply
   bool enableF16 = version == 10 || version ==11;
-  bool transposedInput = version == 9 || version == 11;
+  bool transposedInput = version == 9 || version == 11 || version == 12;
   NumType numtype = enableF16 ? kf16 : kf32;
 
   size_t M, K, N;  // Matrix dimensions
