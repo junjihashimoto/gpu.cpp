@@ -68,7 +68,7 @@ if(NOT DAWN_BUILD_FOUND)
 
   set(DAWN_ALWAYS_ASSERT           ON CACHE INTERNAL "Always assert in Dawn" FORCE)
   set(DAWN_BUILD_PROTOBUF          OFF CACHE INTERNAL "Build protobuf" FORCE)
-  set(DAWN_BUILD_MONOLITHIC_LIBRARY ON CACHE INTERNAL "Build Dawn monolithically" FORCE)
+  set(DAWN_BUILD_MONOLITHIC_LIBRARY SHARED CACHE INTERNAL "Build Dawn monolithically" FORCE)
   set(DAWN_BUILD_EXAMPLES          OFF CACHE INTERNAL "Build Dawn examples" FORCE)
   set(DAWN_BUILD_SAMPLES           OFF CACHE INTERNAL "Build Dawn samples" FORCE)
   set(DAWN_BUILD_TESTS             OFF CACHE INTERNAL "Build Dawn tests" FORCE)
@@ -80,7 +80,7 @@ if(NOT DAWN_BUILD_FOUND)
   set(TINT_BUILD_DOCS              OFF CACHE INTERNAL "Build Tint docs" FORCE)
   set(DAWN_EMSCRIPTEN_TOOLCHAIN    ${EMSCRIPTEN_DIR} CACHE INTERNAL "Emscripten toolchain" FORCE)
 
-  set(DAWN_COMMIT "66d57f910357befb441b91162f29a97f687af6d9" CACHE STRING "Dawn commit to checkout" FORCE)
+  set(DAWN_COMMIT "e1d6e12337080cf9f6d8726209e86df449bc6e9a" CACHE STRING "Dawn commit to checkout" FORCE)
   
   file(MAKE_DIRECTORY ${DAWN_DIR})
   # Initialize Git and set/update remote.
@@ -116,6 +116,13 @@ if(NOT DAWN_BUILD_FOUND)
       string(REGEX REPLACE "-msse4\\.1" "" COPTS_CONTENT "${COPTS_CONTENT}")
       file(WRITE "${ABSEIL_COPTS_FILE}" "${COPTS_CONTENT}")
     endif()
+  endif()
+
+  set(FIX_FILE "${DAWN_DIR}/src/dawn/native/metal/PhysicalDeviceMTL.mm")
+  if(EXISTS "${FIX_FILE}")
+    file(READ  "${FIX_FILE}" FIX_CONTENT)
+    string(REGEX REPLACE "kIOMainPortDefault" "0" FIX_CONTENT "${FIX_CONTENT}")
+    file(WRITE "${FIX_FILE}" "${FIX_CONTENT}")
   endif()
 
 # Fetch the Dawn repository if not already present.
