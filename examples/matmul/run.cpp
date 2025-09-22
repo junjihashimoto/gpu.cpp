@@ -3,6 +3,8 @@
 #include <future>
 #include <random>
 #include <cstdlib>
+#include <exception>
+#include <iostream>
 
 #include "gpu.hpp" // createContext, createTensor, createKernel, dispatchKernel,
                    // wait, resetCommandBuffer, toCPU
@@ -615,63 +617,78 @@ inline KernelCode createMatmulWithTranspose(const char *shaderTemplate, const si
 
 inline KernelCode createMatmul12(const char *shaderTemplate, const size_t M,
                                  const size_t K, const size_t N,
+                                 const size_t TM, const size_t TN,
+                                 const Shape &workgroupSize = {256, 1, 1},
                                  NumType precision = kf32) {
   std::string codeString(shaderTemplate);
   replaceAll(codeString, {{"{{precision}}", toString(precision)},
                           {"{{M}}", toString(M)},
                           {"{{K}}", toString(K)},
-                          {"{{N}}", toString(N)}});
-  return {codeString, {256, 1, 1}, precision};
+                          {"{{N}}", toString(N)},
+                          {"{{TM}}", toString(TM)},
+                          {"{{TN}}", toString(TN)}
+    });
+  return {codeString, workgroupSize, precision};
 }
-
-
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Optimised WGSL matrix‑multiply kernel using subgroupMatrixLoad/Store
 //  and subgroupMatrixMultiplyAccumulate
 // ─────────────────────────────────────────────────────────────────────────────
 const char* kShaderSubgroupMatrixMultiply = R"(
+enable subgroups;
 enable chromium_experimental_subgroup_matrix;
 
-@group(0) @binding(0) var<storage, read> A: array<{{precision}}>;
-@group(0) @binding(1) var<storage, read> B: array<{{precision}}>;
-@group(0) @binding(2) var<storage, read_write> C: array<{{precision}}>;
+@group(0) @binding(0) var<storage, read_write>  A: array<{{precision}}>;
+@group(0) @binding(1) var<storage, read_write>  B: array<{{precision}}>;
+@group(0) @binding(2) var<storage, read_write>  C: array<{{precision}}>;
 
-// Each workgroup computes one 16x16 tile of C.
-@compute @workgroup_size(256, 1, 1)
-fn main(@builtin(workgroup_id) groupID: vec3<u32>) {
+@compute @workgroup_size({{workgroupSize}})
+fn main(@builtin(workgroup_id) wg: vec3<u32>,
+        @builtin(local_invocation_id) lid: vec3<u32>,
+        @builtin(subgroup_id) sgid: u32,
+        @builtin(subgroup_size) ssize: u32) {
 
-    let tileRow = groupID.y;
-    let tileCol = groupID.x;
+  let rowStart: u32 = wg.x * 8u * {{TM}};
+  let colStart: u32 = wg.y * 8u * {{TN}};
 
-    let outRowStart = tileRow * 16u;
-    let outColStart = tileCol * 16u;
+  if (rowStart >= u32({{M}}) || colStart >= u32({{N}})) { return; }
 
-    if (outRowStart >= {{M}} || outColStart >= {{N}}) {
-        return;
+  let baseA: u32 = rowStart * {{K}};
+  let baseB: u32 = colStart;
+  let cBase: u32 = rowStart * {{N}} + colStart;
+
+  var Ax: array<subgroup_matrix_left<{{precision}}, 8, 8>, {{TM}}>;
+  var Bx: array<subgroup_matrix_right<{{precision}}, 8, 8>, {{TN}}>;
+
+  // 4x4 accumulators (8x8 each)
+  var accxx: array<subgroup_matrix_result<{{precision}}, 8, 8>, {{TM}} * {{TN}}>;
+
+  for (var k: u32 = 0u; k < {{K}}; k = k + 8u) {
+    workgroupBarrier();
+    for (var i: u32 = 0; i < {{TM}}; i++) {
+      Ax[i] = subgroupMatrixLoad<subgroup_matrix_left<{{precision}},8,8>>(&A, baseA +  i * 8u*{{K}} + k, false, {{K}});
     }
 
-    var acc: subgroup_matrix_result<{{precision}}, 16, 16>;
-
-    let kTiles = ({{K}} + 15u) / 16u;
-
-    // Load the first tile and multiply to initialize accumulator
-    let a_tile_0 = subgroupMatrixLoad<subgroup_matrix_left<{{precision}}, 16, 16>>(A, outRowStart * {{K}}, true, {{K}});
-    let b_tile_0 = subgroupMatrixLoad<subgroup_matrix_right<{{precision}}, 16, 16>>(B, outColStart, true, {{N}});
-    acc = subgroupMatrixMultiply<{{precision}}>(a_tile_0, b_tile_0);
-
-    // Loop over the rest of the K-dimension
-    for (var kTile: u32 = 1u; kTile < kTiles; kTile = kTile + 1u) {
-        let k = kTile * 16u;
-        let a_tile = subgroupMatrixLoad<subgroup_matrix_left<{{precision}}, 16, 16>>(A, outRowStart * {{K}} + k, true, {{K}});
-        let b_tile = subgroupMatrixLoad<subgroup_matrix_right<{{precision}}, 16, 16>>(B, k * {{N}} + outColStart, true, {{N}});
-        acc = subgroupMatrixMultiplyAccumulate(a_tile, b_tile, acc);
+    for (var i: u32 = 0; i < {{TN}}; i++) {
+      Bx[i] = subgroupMatrixLoad<subgroup_matrix_right<{{precision}},8,8>>(&B, baseB + k*{{N}} +  8u * i, false, {{N}});
     }
 
-    subgroupMatrixStore(C, outRowStart * {{N}} + outColStart, acc, true, {{N}});
+    for (var i: u32 = 0; i < {{TM}}; i++) {
+      for (var j: u32 = 0; j < {{TN}}; j++) {
+        accxx[i+j*{{TM}}] = subgroupMatrixMultiplyAccumulate(Ax[i], Bx[j], accxx[i+j*{{TM}}]);
+      }
+    }
+  }
+
+  workgroupBarrier();
+  for (var i: u32 = 0; i < {{TM}}; i++) {
+    for (var j: u32 = 0; j < {{TN}}; j++) {
+      subgroupMatrixStore(&C, cBase + i * 8u * {{N}} + 8u * j, accxx[i+j*{{TM}}], false, {{N}});
+    }
+  }
 }
 )";
-
 
 /**
  * @brief No-Op shader with matmul bindings for performance testing
@@ -743,26 +760,30 @@ Kernel selectMatmul(Context &ctx, int version,
                     const Bindings</* input, weights, output */ 3> &bindings,
                     size_t M, size_t K, size_t N, NumType numtype) {
   Kernel kernel;
+  CompilationInfo info;
   if (version == 1) {
     Shape wgSize = {256, 1, 1};
     Shape nWorkgroups = cdiv({M, N, 1}, {16, 16, 1});
     KernelCode matmul = createNoOp(kShaderNoOp, /*wgsize*/ wgSize);
     kernel = createKernel(ctx, matmul, bindings,
-                          /*nWorkgroups*/ nWorkgroups);
+                          /*nWorkgroups*/ nWorkgroups,
+                          NoParam{}, &info);
   } else if (version == 2) {
     Shape wgSize = {16, 16, 1};
     LOG(kDefLog, kInfo, "wgSize: %s", toString(wgSize).c_str());
     KernelCode matmul =
       createMatmul1(kShaderMatmul1, M, K, N, /*wgsize*/ wgSize, numtype);
     kernel = createKernel(ctx, matmul, bindings,
-                          /*nWorkgroups*/ cdiv({M, N, 1}, wgSize));
+                          /*nWorkgroups*/ cdiv({M, N, 1}, wgSize),
+                          NoParam{}, &info);
   } else if (version == 3) {
     static constexpr size_t tileSize = 16;
     KernelCode matmul = createMatmul2(kShaderMatmul2, M, K, N,
                                       /*wgSize*/ {tileSize * tileSize, 1, 1}, numtype);
     kernel =
         createKernel(ctx, matmul, bindings,
-                     /* nWorkgroups*/ cdiv({M, N, 1}, {tileSize, tileSize, 1}));
+                     /* nWorkgroups*/ cdiv({M, N, 1}, {tileSize, tileSize, 1}),
+                          NoParam{}, &info);
   } else if (version == 4 || version == 6) {
     static constexpr size_t BM = 64;
     static constexpr size_t BK = 4;
@@ -781,7 +802,8 @@ Kernel selectMatmul(Context &ctx, int version,
 				      numtype,
 				      /*Loop unrolling*/ version == 6 ? true: false);
     kernel = createKernel(ctx, matmul, bindings,
-                          /*nWorkgroups*/ nWorkgroups);
+                          /*nWorkgroups*/ nWorkgroups,
+                          NoParam{}, &info);
   } else if (version == 5 || version == 7) {
     static constexpr size_t BM = 64;
     static constexpr size_t BK = 8;
@@ -799,7 +821,8 @@ Kernel selectMatmul(Context &ctx, int version,
 				      numtype,
 				      /*Loop unrolling*/ version == 7 ? true: false);
     kernel = createKernel(ctx, matmul, bindings,
-                          /*nWorkgroups*/ nWorkgroups);
+                          /*nWorkgroups*/ nWorkgroups,
+                          NoParam{}, &info);
   } else if (version == 8 || version == 10) {
     static constexpr size_t BM = 64;
     static constexpr size_t BK = 8;
@@ -817,7 +840,8 @@ Kernel selectMatmul(Context &ctx, int version,
 						      numtype,
 						      /*Loop unrolling*/ true);
     kernel = createKernel(ctx, matmul, bindings,
-                          /*nWorkgroups*/ nWorkgroups);
+                          /*nWorkgroups*/ nWorkgroups,
+                          NoParam{}, &info);
   } else if (version == 9 || version == 11) {
     static constexpr size_t BM = 64;
     static constexpr size_t BK = 8;
@@ -834,18 +858,37 @@ Kernel selectMatmul(Context &ctx, int version,
 						  /*wgSize*/ wgSize,
 						  numtype);
     kernel = createKernel(ctx, matmul, bindings,
-                          /*nWorkgroups*/ nWorkgroups);
+                          /*nWorkgroups*/ nWorkgroups,
+                          NoParam{}, &info);
   } else if (version == 12) {
     // f32: Subgroup matrix multiply
-    Shape wgSize = {256, 1, 1}; // One subgroup per workgroup
-    Shape nWorkgroups = {cdiv(N, 16), cdiv(M, 16), 1};
+    static constexpr size_t TM = 2;
+    static constexpr size_t TN = 4;
+    Shape wgSize = {64, 1, 1}; // One subgroup per workgroup
+    Shape nWorkgroups = {cdiv(M, 8 * TM), cdiv(N, 8 * TN), 1};
     LOG(kDefLog, kInfo, "M: %zu, K: %zu, N: %zu", M, K, N);
     LOG(kDefLog, kInfo, "wgSize: ( %s )", toString(wgSize).c_str());
     LOG(kDefLog, kInfo, "nWorkgroups: ( %s )", toString(nWorkgroups).c_str());
-    KernelCode matmul =
-        createMatmul12(kShaderSubgroupMatrixMultiply, M, K, N, numtype);
-    kernel = createKernel(ctx, matmul, bindings, nWorkgroups);
+    KernelCode matmul = createMatmul12(kShaderSubgroupMatrixMultiply, M, K, N, TM, TN, wgSize, numtype);
+    kernel = createKernel(ctx, matmul, bindings, nWorkgroups,
+                          NoParam{}, &info);
   }
+
+  if (info.status != WGPUCompilationInfoRequestStatus_Success) {
+    LOG(kDefLog, kError, "Failed to compile shader");
+    for (size_t i = 0; i < info.messages.size(); i++) {
+      LOG(kDefLog, kError, "Line %llu, Pos %llu: %s", info.lineNums[i],
+          info.linePos[i], info.messages[i].c_str());
+    }
+    exit(1);
+  } else {
+    LOG(kDefLog, kInfo, "Shader compiled successfully");
+    for (size_t i = 0; i < info.messages.size(); i++) {
+      LOG(kDefLog, kInfo, "Line %llu, Pos %llu: %s", info.lineNums[i],
+          info.linePos[i], info.messages[i].c_str());
+    }
+  }
+  
   return kernel;
 }
 
@@ -866,36 +909,49 @@ void runTest(int version, size_t M, size_t K, size_t N,
   devDescriptor.requiredFeatureCount = 1;
   devDescriptor.requiredFeatures = std::array{WGPUFeatureName_ShaderF16}.data();
 
-  Context ctx;
-  if (numtype == kf16) {
-    ctx = createContext(
-        {}, {},
-        /*device descriptor, enabling f16 in WGSL*/
-        {
-          .requiredFeatureCount = 1,
-          .requiredFeatures = std::array{WGPUFeatureName_ShaderF16}.data()
-        });
-    if (ctx.adapterStatus != WGPURequestAdapterStatus_Success) {
-      LOG(kDefLog, kError, "Failed to create adapter with f16 support, try running an f32 test instead (`export MATMUL_VERSION=9).");
-      exit(1);
-    }
-    if (ctx.deviceStatus != WGPURequestDeviceStatus_Success) {
-      LOG(kDefLog, kError, "Failed to create device with f16 support, try running an f32 test instead. (`export MATMUL_VERSION=9)");
-      exit(1);
-    }
-  }
+  WGPUDawnTogglesDescriptor toggles = {};
+  toggles.chain.sType = WGPUSType_DawnTogglesDescriptor;
+  const char* enableList[] = {"allow_unsafe_apis"};
+  toggles.enabledToggles = enableList;
+  toggles.enabledToggleCount = 1;
 
-  if (numtype == kf32) {
-    ctx = createContext({}, {}, {});
-    if (ctx.adapterStatus != WGPURequestAdapterStatus_Success ||
-        ctx.deviceStatus != WGPURequestDeviceStatus_Success) {
-      LOG(kDefLog, kError, "Failed to create adapter or device");
-      // stop execution
-      exit(1);
-    } else {
-      LOG(kDefLog, kInfo, "Successfully created adapter and device");
+  WGPUDeviceDescriptor devDesc = {};
+  devDesc.nextInChain = &toggles.chain; 
+  devDesc.requiredFeatureCount = 3,
+    devDesc.requiredFeatures = std::array{
+      WGPUFeatureName_ShaderF16,
+      WGPUFeatureName_Subgroups,
+      WGPUFeatureName_ChromiumExperimentalSubgroupMatrix
+    }.data();
+  devDesc.uncapturedErrorCallbackInfo = WGPUUncapturedErrorCallbackInfo {
+    .callback = [](WGPUDevice const * device, WGPUErrorType type, WGPUStringView msg, void*, void*) {
+      LOG(kDefLog, kError, "[Uncaptured %d] %.*s\n", (int)type, (int)msg.length, msg.data);
     }
-  } 
+  };
+  devDesc.deviceLostCallbackInfo = WGPUDeviceLostCallbackInfo {
+    .mode = WGPUCallbackMode_AllowSpontaneous,
+    .callback = [](WGPUDevice const * device, WGPUDeviceLostReason reason, WGPUStringView msg, void*, void*) {
+      LOG(kDefLog, kError, "[DeviceLost %d] %.*s\n", (int)reason, (int)msg.length, msg.data);
+    }
+  };
+    
+  Context ctx = createContext({}, {}, devDesc);
+    
+  WGPULoggingCallbackInfo logCb{
+    .callback = [](WGPULoggingType type, WGPUStringView msg, void*, void*) {
+      LOG(kDefLog, kError, "[WGPU %d] %.*s\n", (int)type, (int)msg.length, msg.data);
+    }
+  };
+  wgpuDeviceSetLoggingCallback(ctx.device, logCb);
+    
+  if (ctx.adapterStatus != WGPURequestAdapterStatus_Success ||
+      ctx.deviceStatus != WGPURequestDeviceStatus_Success) {
+    LOG(kDefLog, kError, "Failed to create adapter or device");
+    // stop execution
+    exit(1);
+  } else {
+    LOG(kDefLog, kInfo, "Successfully created adapter and device");
+  }
 
   Tensor input = createTensor(ctx, Shape{M, K}, numtype, inputPtr.get());
   Tensor weights = createTensor(ctx, Shape{N, K}, numtype, weightsPtr.get()); // column-major
@@ -983,14 +1039,15 @@ const std::string versionToStr(int version){
   case 9: return  "f32: 2D blocktiling with loop unrolling, vectorization and transpose";
   case 10: return "f16: 2D blocktiling with loop unrolling and vectorization (default)";
   case 11: return "f16: 2D blocktiling with loop unrolling, vectorization and transpose";
-  case 12: return "f32: Subgroup matrix multiply";
+  case 12: return "f16: Subgroup matrix multiply with transpose";
   default: return "Not specified";
   }
 }
 
 int main() {
+  std::cout << "Starting matmul test..." << std::endl;
   char* version_str = getenv("MATMUL_VERSION");
-  int version = version_str == NULL ? 12 : atoi(version_str);
+  int version = version_str == NULL ? 11 : atoi(version_str);
     // 1 == f32: No-Op
     // 2 == f32: naive matmul
     // 3 == f32: tiling
@@ -1002,8 +1059,8 @@ int main() {
     // 9 == f32: 2D blocktiling with loop unrolling, vectorization and transpose
     // 10 == f16: 2D blocktiling with loop unrolling and vectorization (default)
     // 11 == f16: 2D blocktiling with loop unrolling, vectorization and transpose
-    // 12 == f32: Subgroup matrix multiply
-  bool enableF16 = version == 10 || version ==11;
+    // 12 == f16: Subgroup matrix multiply with transpose
+  bool enableF16 = version == 10 || version ==11 || version == 12;
   bool transposedInput = version == 9 || version == 11 || version == 12;
   NumType numtype = enableF16 ? kf16 : kf32;
 

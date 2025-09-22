@@ -16,7 +16,7 @@ run: ./build/$(TARGET)
 	$(LIBSPEC) && ./build/$(TARGET)
 
 debug: run.cpp
-	mkdir -p build && $(CXX) $(FLAGS) -g -fsanitize=address -fno-omit-frame-pointer -Wall -o ./build/$(TARGET)
+	mkdir -p build && $(CXX) $(FLAGS) -g -fsanitize=address -fno-omit-frame-pointer -fasynchronous-unwind-tables -Wall -o ./build/$(TARGET)
 
 run_with_metal_profiler: ./build/$(TARGET)_with_metal_profiler
 	$(LIBSPEC) && export METAL_CAPTURE_ENABLED=1 && ./build/$(TARGET)_with_metal_profiler

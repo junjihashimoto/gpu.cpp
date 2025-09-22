@@ -412,7 +412,7 @@ struct KernelCode {
     }
     replaceAll(data, "{{workgroupSize}}", toString(workgroupSize));
     replaceAll(data, "{{precision}}", toString(precision));
-    LOG(kDefLog, kInfo, "Shader code:\n%s", data.c_str());
+    LOG(kDefLog, kTrace, "Shader code:\n%s", data.c_str());
   }
 
   /**
@@ -438,7 +438,7 @@ struct KernelCode {
     replaceAll(data, "{{workgroupSize}}", toString(workgroupSize));
     replaceAll(data, "{{precision}}", toString(precision));
     replaceAll(data, "{{totalWorkgroups}}", toString(totalWorkgroups));
-    LOG(kDefLog, kInfo, "Shader code:\n%s", data.c_str());
+    LOG(kDefLog, kTrace, "Shader code:\n%s", data.c_str());
   }
 
   /**
@@ -464,7 +464,7 @@ struct KernelCode {
     replaceAll(data, "{{workgroupSize}}", toString({workgroupSize, 1, 1}));
     replaceAll(data, "{{precision}}", toString(precision));
     replaceAll(data, "{{totalWorkgroups}}", toString(totalWorkgroups));
-    LOG(kDefLog, kInfo, "Shader code:\n%s", data.c_str());
+    LOG(kDefLog, kTrace, "Shader code:\n%s", data.c_str());
   }
 
   std::string data;
@@ -1309,6 +1309,7 @@ createContextAsync(const WGPUInstanceDescriptor &desc = {},
     ctx.device = wait(ctx, deviceFuture);
     ctx.deviceStatus = WGPURequestDeviceStatus_Success;
   } catch (const std::exception &ex) {
+    LOG(kDefLog, kTrace, "requestDeviceAsync: %s", ex.what());
     promise->set_exception(std::make_exception_ptr(ex));
     return promise->get_future();
   }
@@ -1594,7 +1595,7 @@ inline void bufferMapCallback(WGPUMapAsyncStatus status, WGPUStringView message,
  * and a promise to signal completion.
  * @param userdata2 Unused.
  */
-inline void queueWorkDoneCallback(WGPUQueueWorkDoneStatus status,
+inline void queueWorkDoneCallback(WGPUQueueWorkDoneStatus status, WGPUStringView message,
                                   void *userdata1, void * /*userdata2*/) {
   const CallbackData *cbData = static_cast<CallbackData *>(userdata1);
   // Ensure the queue work finished successfully.
@@ -2837,7 +2838,7 @@ Kernel createKernel(Context &ctx, const KernelCode &code,
  * when the work is done.
  * @param userdata2 Unused.
  */
-inline void dispatchKernelCallback(WGPUQueueWorkDoneStatus status,
+inline void dispatchKernelCallback(WGPUQueueWorkDoneStatus status, WGPUStringView message,
                                    void *userdata1, void * /*userdata2*/) {
   // Cast the userdata pointer back to our heap‑allocated promise.
   auto *p = reinterpret_cast<std::promise<void> *>(userdata1);
